@@ -994,14 +994,14 @@ def narration_for_slide(rng: random.Random, s: Slide) -> str:
             "If you feel watched, do not react.",
             "Do not read the notes aloud.",
         ])
-        return f"{s.title}. {re.sub(r'[^A-Za-z0-9 ,\.\']+', ' ', s.body)}. {tail}"
+        return f"{s.title}. {re.sub(r'[^A-Za-z0-9]+', ' ', s.body)}. {tail}"
     # protocol
     tail = rng.choice([
         "Description teaches it.",
         "Silence is a valid response.",
         "If you are watching, you are participating.",
     ])
-    return f"{s.title}. {re.sub(r'[^A-Za-z0-9 ,\.\']+', ' ', s.body)}. {tail}"
+    return f"{s.title}. {re.sub(r'[^A-Za-z0-9]+', ' ', s.body)}. {tail}"
 
 
 # ----------------------------
