@@ -668,7 +668,8 @@ def vhs_stack(ctx: RenderContext, rng: random.Random, frame: np.ndarray) -> np.n
 
     # Noise
     level = int(10 + 10*s)
-    n = rng.randint(-level, level+1, size=out.shape, dtype=np.int16)
+    # Replaced rng.randint with np.random.randint to support size/dtype arguments
+    n = np.random.randint(-level, level+1, size=out.shape, dtype=np.int16)
     out = np.clip(out.astype(np.int16) + n, 0, 255).astype(np.uint8)
 
     # Vignette
@@ -1025,6 +1026,8 @@ def main() -> None:
     workdir = Path(cfg["workdir"])
     workdir.mkdir(parents=True, exist_ok=True)
     rng = random.Random(cfg["seed"])
+    # Seed numpy as well for array operations
+    np.random.seed(cfg["seed"])
 
     # Check dependencies
     has_ffmpeg = shutil.which("ffmpeg") is not None
