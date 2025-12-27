@@ -1,0 +1,58 @@
+name: Generate Horror PPT VHS Video
+
+on:
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: "Seed (optional). Leave empty for random."
+        required: false
+        default: ""
+      theme:
+        description: "Force theme key (optional)."
+        required: false
+        default: ""
+      web:
+        description: "Enable web scraping (true/false)"
+        required: false
+        default: "true"
+      encrypt_words:
+        description: "Comma-separated words to encrypt (optional)"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: System deps (ffmpeg + espeak)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg espeak
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Generate
+        env:
+          SEED: ${{ inputs.seed }}
+          THEME_FORCE: ${{ inputs.theme }}
+          WEB_ENABLE: ${{ inputs.web }}
+          ENCRYPT_WORDS: ${{ inputs.encrypt_words }}
+        run: |
+          python generate.py --config config.yaml --out out.mp4
+
+      - name: Upload video artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: horror-ppt-vhs
+          path: out.mp4
