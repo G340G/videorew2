@@ -1029,7 +1029,7 @@ def main() -> None:
     if seed == 1337:
         seed = random.randint(0, 1000000)
     rng = random.Random(seed)    # Seed numpy as well for array operations
-        np.random.seed(cfg["seed"])
+    np.random.seed(cfg["seed"])
 
     # Check dependencies
     has_ffmpeg = shutil.which("ffmpeg") is not None
