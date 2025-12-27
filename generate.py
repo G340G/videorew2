@@ -655,7 +655,9 @@ def vhs_stack(ctx: RenderContext, rng: random.Random, frame: np.ndarray) -> np.n
 
     # Scanlines
     if s > 0:
-        out = (out.astype(np.float32) * (0.86 + 0.14*np.sin(np.arange(H)[:,None]*math.pi))).astype(np.uint8)
+        # Use [:, None, None] to expand dimensions to (H, 1, 1) for broadcasting against (H, W, 3)
+        scanlines = (0.86 + 0.14 * np.sin(np.arange(H)[:, None, None] * math.pi))
+        out = (out.astype(np.float32) * scanlines).astype(np.uint8)
 
     # Tracking line
     if rng.random() < 0.35*s:
@@ -669,7 +671,7 @@ def vhs_stack(ctx: RenderContext, rng: random.Random, frame: np.ndarray) -> np.n
     n = rng.randint(-level, level+1, size=out.shape, dtype=np.int16)
     out = np.clip(out.astype(np.int16) + n, 0, 255).astype(np.uint8)
 
-    # Vignette (precalc could be faster, but this is fine)
+    # Vignette
     yy, xx = np.mgrid[0:H, 0:W]
     cx, cy = W/2, H/2
     r = np.sqrt((xx-cx)**2 + (yy-cy)**2) / math.sqrt(cx**2 + cy**2)
