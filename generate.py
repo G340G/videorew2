@@ -1025,9 +1025,11 @@ def main() -> None:
     cfg = load_config(Path(args.config))
     workdir = Path(cfg["workdir"])
     workdir.mkdir(parents=True, exist_ok=True)
-    rng = random.Random(cfg["seed"])
-    # Seed numpy as well for array operations
-    np.random.seed(cfg["seed"])
+    seed = cfg["seed"]
+    if seed == 1337:
+        seed = random.randint(0, 1000000)
+    rng = random.Random(seed)    # Seed numpy as well for array operations
+        np.random.seed(cfg["seed"])
 
     # Check dependencies
     has_ffmpeg = shutil.which("ffmpeg") is not None
