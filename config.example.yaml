@@ -1,0 +1,62 @@
+# Example configuration for the VHS job-training analogue horror generator
+# Run: python generate.py --config config.yaml --out out.mp4
+
+seed: 1337          # can also be ${SEED} from GitHub Actions env
+theme_key: ""       # leave blank to let the "brain" pick a theme key each run
+
+workdir: .work
+local_images_dir: assets/images   # drop your own images here; they will be used in slides
+
+web:
+  enable: true
+  text_paragraphs: 10
+  image_limit: 12
+  timeout_s: 15
+
+render:
+  width: 640
+  height: 480          # 4:3 VHS
+  fps: 15
+  slide_seconds: 3.2
+  # pop-up distorted images (max 3, ~0.5s each)
+  max_popups: 3
+  popup_seconds: 0.5
+  # VHS + censorship intensity
+  vhs_strength: 1.25
+  redaction_strength: 1.4
+  # one-frame flashes (jump cuts)
+  flashes: 12
+
+audio:
+  sr: 44100
+  music: true
+  tts: true
+  # espeak settings (voices vary by environment)
+  tts_speed: 155
+  tts_pitch: 32
+  tts_amp: 170
+  voices:
+    - en-us
+    - en
+    - en-uk-rp
+    - en-uk-north
+    - en-sc
+
+transmission:
+  enable: true
+  # chance a random tape failure happens
+  error_probability: 0.35
+  # given an error, chance of a freeze moment
+  freeze_probability: 0.6
+  # given an error, chance the tape cuts out early
+  early_end_probability: 0.45
+  freeze_seconds_min: 0.8
+  freeze_seconds_max: 2.2
+
+story:
+  slide_count: 10
+  normal_ratio: 0.45     # mix normal wellness + scary protocol slides
+  include_intro_outro: true
+  include_jane_doe: true
+  include_fatal: true
+  easter_egg_probability: 0.25
