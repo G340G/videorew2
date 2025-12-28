@@ -1,6 +1,7 @@
-requests
-pyyaml
 numpy
+Pillow
+PyYAML
+requests
 scipy
-pillow
 imageio
+imageio-ffmpeg
