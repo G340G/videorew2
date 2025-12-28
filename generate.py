@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-generate.py — "Found VHS Job Training" analogue horror PPT generator (ARG template + Lone Shooter entity).
+generate.py — "Found VHS Job Training" analogue horror PPT generator.
 
-- Always-different theme keyword chosen from random online sources (Wikipedia random page / Wiktionary random word).
-- Stable ARG template every run (90s PPT vibe): intro (tape no), agenda, normal slides, protocol slides,
-  infographic, intermissions/errors (rare), outro.
-- Web scraping: Wikipedia text + Wikimedia Commons images; expands queries from extracted terms.
-- Lone Shooter entity: fictional shadow figure with bright eyes (no weapons/violence), appears sparingly in overlay + text.
-- Redactions & censorship blocks, encrypted puzzle slide, popups and rare flashes, VHS artifacts.
-- Audio: distorted 90s "training jingle" + noise stingers + multi-voice TTS via espeak.
+- Always-different theme keyword chosen from random online sources.
+- Stable ARG template every run (90s PPT vibe).
+- Web scraping: Wikipedia text + Wikimedia Commons images.
+- Lone Shooter entity: fictional shadow figure with bright eyes.
+- Audio: distorted 90s "training jingle" + noise stingers + TTS.
+- FIXED: Replaced imageio with direct ffmpeg piping to avoid backend errors.
 
 Usage:
   python generate.py --config config.yaml --out out.mp4
@@ -27,6 +26,7 @@ import re
 import shutil
 import subprocess
 import textwrap
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -34,16 +34,15 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import requests
 import yaml
-import imageio.v2 as imageio
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 from scipy.io.wavfile import read as read_wav
 from scipy.io.wavfile import write as write_wav
 
-UA = "pptex-vhs-generator/3.0 (+github-actions; educational/art project)"
+UA = "pptex-vhs-generator/3.1 (+github-actions; educational/art project)"
 
 DEFAULTS: Dict[str, Any] = {
     "seed": 1337,
-    "theme_source": "random_online",   # random_online | fixed
+    "theme_source": "random_online",
     "theme_key": "",
     "workdir": ".work",
     "local_images_dir": "assets/images",
@@ -52,22 +51,11 @@ DEFAULTS: Dict[str, Any] = {
         "timeout_s": 15,
         "text_paragraphs": 10,
         "image_limit": 16,
-        "random_source": "mix",     # wikipedia | wiktionary | mix
+        "random_source": "mix",
         "random_attempts": 5,
         "min_keyword_len": 3,
         "max_keyword_len": 48,
-        "query_expand": [
-            "{k}",
-            "{k} poster",
-            "{k} office",
-            "{k} training",
-            "{k} portrait",
-            "{k} hallway",
-            "{k} signage",
-            "{k} manual",
-            "{k} archive",
-            "{k} surveillance",
-        ],
+        "query_expand": ["{k}", "{k} poster", "{k} office", "{k} training"],
     },
     "story": {
         "slide_count": 12,
@@ -116,6 +104,60 @@ DEFAULTS: Dict[str, Any] = {
         "freeze_seconds_max": 2.2,
     },
 }
+
+# ----------------------------
+# FFmpeg Writer (Replacement for imageio)
+# ----------------------------
+
+class FFmpegWriter:
+    def __init__(self, filename: str, width: int, height: int, fps: int):
+        self.filename = filename
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.proc = None
+
+    def start(self):
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "rawvideo",
+            "-vcodec", "rawvideo",
+            "-s", f"{self.width}x{self.height}",
+            "-pix_fmt", "rgb24",
+            "-r", str(self.fps),
+            "-i", "-",
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-preset", "medium",
+            "-crf", "23",  # Quality similar to 'quality=7' in imageio
+            self.filename
+        ]
+        # Open subprocess with stdin pipe
+        self.proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+
+    def write(self, frame: np.ndarray):
+        if self.proc is None:
+            self.start()
+        
+        # Ensure frame matches expected dimensions
+        if frame.shape[0] != self.height or frame.shape[1] != self.width:
+            frame = np.array(Image.fromarray(frame).resize((self.width, self.height)))
+            
+        # Write raw bytes
+        if self.proc.stdin:
+            try:
+                self.proc.stdin.write(frame.tobytes())
+            except BrokenPipeError:
+                pass
+
+    def close(self):
+        if self.proc:
+            if self.proc.stdin:
+                self.proc.stdin.close()
+            self.proc.wait()
+            self.proc = None
 
 # ----------------------------
 # Config helpers
@@ -169,66 +211,12 @@ def load_config(path: Path) -> Dict[str, Any]:
     cfg["theme_key"] = str(resolve_env_value(cfg.get("theme_key", "")) or "").strip()
     cfg["workdir"] = str(resolve_env_value(cfg.get("workdir", ".work")) or ".work")
     cfg["local_images_dir"] = str(resolve_env_value(cfg.get("local_images_dir", "assets/images")) or "assets/images")
-
+    
+    # Ensure web config values
     w = cfg["web"]
     w["enable"] = coerce_type(w.get("enable"), True, bool)
     w["timeout_s"] = coerce_type(w.get("timeout_s"), 15, int)
-    w["text_paragraphs"] = coerce_type(w.get("text_paragraphs"), 10, int)
-    w["image_limit"] = coerce_type(w.get("image_limit"), 16, int)
-    w["random_attempts"] = coerce_type(w.get("random_attempts"), 5, int)
-    w["min_keyword_len"] = coerce_type(w.get("min_keyword_len"), 3, int)
-    w["max_keyword_len"] = coerce_type(w.get("max_keyword_len"), 48, int)
-    w["random_source"] = str(w.get("random_source", "mix") or "mix").strip().lower()
-    if not isinstance(w.get("query_expand"), list) or not w["query_expand"]:
-        w["query_expand"] = DEFAULTS["web"]["query_expand"]
-
-    s = cfg["story"]
-    s["slide_count"] = coerce_type(s.get("slide_count"), 12, int)
-    s["normal_ratio"] = coerce_type(s.get("normal_ratio"), 0.45, float)
-    s["include_intro_outro"] = coerce_type(s.get("include_intro_outro"), True, bool)
-    s["include_infographic"] = coerce_type(s.get("include_infographic"), True, bool)
-    s["include_jane_doe"] = coerce_type(s.get("include_jane_doe"), True, bool)
-    s["include_fatal"] = coerce_type(s.get("include_fatal"), True, bool)
-    s["fatal_probability"] = coerce_type(s.get("fatal_probability"), 0.12, float)
-    s["jane_doe_probability"] = coerce_type(s.get("jane_doe_probability"), 0.18, float)
-    s["easter_egg_probability"] = coerce_type(s.get("easter_egg_probability"), 0.33, float)
-    s["entity_mentions_min"] = coerce_type(s.get("entity_mentions_min"), 2, int)
-    s["entity_mentions_max"] = coerce_type(s.get("entity_mentions_max"), 5, int)
-
-    r = cfg["render"]
-    r["width"] = coerce_type(r.get("width"), 640, int)
-    r["height"] = coerce_type(r.get("height"), 480, int)
-    r["fps"] = coerce_type(r.get("fps"), 15, int)
-    r["slide_seconds"] = coerce_type(r.get("slide_seconds"), 3.2, float)
-    r["max_popups"] = coerce_type(r.get("max_popups"), 3, int)
-    r["popup_seconds"] = coerce_type(r.get("popup_seconds"), 0.5, float)
-    r["micro_popup_probability"] = coerce_type(r.get("micro_popup_probability"), 0.07, float)
-    r["vhs_strength"] = coerce_type(r.get("vhs_strength"), 1.25, float)
-    r["redaction_strength"] = coerce_type(r.get("redaction_strength"), 1.25, float)
-    r["flashes"] = coerce_type(r.get("flashes"), 12, int)
-    r["censor_probability"] = coerce_type(r.get("censor_probability"), 0.35, float)
-    r["entity_overlay_probability"] = coerce_type(r.get("entity_overlay_probability"), 0.09, float)
-
-    a = cfg["audio"]
-    a["sr"] = coerce_type(a.get("sr"), 44100, int)
-    a["music"] = coerce_type(a.get("music"), True, bool)
-    a["tts"] = coerce_type(a.get("tts"), True, bool)
-    a["tts_speed"] = coerce_type(a.get("tts_speed"), 155, int)
-    a["tts_pitch"] = coerce_type(a.get("tts_pitch"), 32, int)
-    a["tts_amp"] = coerce_type(a.get("tts_amp"), 170, int)
-    a["stinger_count"] = coerce_type(a.get("stinger_count"), 22, int)
-    a["jingle_strength"] = coerce_type(a.get("jingle_strength"), 1.0, float)
-    if not isinstance(a.get("voices"), list) or not a["voices"]:
-        a["voices"] = DEFAULTS["audio"]["voices"]
-
-    t = cfg["transmission"]
-    t["enable"] = coerce_type(t.get("enable"), True, bool)
-    t["error_probability"] = coerce_type(t.get("error_probability"), 0.38, float)
-    t["freeze_probability"] = coerce_type(t.get("freeze_probability"), 0.62, float)
-    t["early_end_probability"] = coerce_type(t.get("early_end_probability"), 0.45, float)
-    t["freeze_seconds_min"] = coerce_type(t.get("freeze_seconds_min"), 0.8, float)
-    t["freeze_seconds_max"] = coerce_type(t.get("freeze_seconds_max"), 2.2, float)
-
+    
     return cfg
 
 # ----------------------------
@@ -260,8 +248,7 @@ def wiktionary_random_word(timeout_s: int) -> Optional[str]:
         js = _http_get(url, timeout_s).json()
         it = (js.get("query", {}).get("random") or [{}])[0]
         t = _clean_keyword(it.get("title", ""))
-        if ":" in t:
-            return None
+        if ":" in t: return None
         return t or None
     except Exception:
         return None
@@ -274,45 +261,36 @@ def choose_theme_key(rng: random.Random, cfg: Dict[str, Any]) -> str:
     attempts = max(1, int(wcfg.get("random_attempts", 5)))
     mode = str(wcfg.get("random_source", "mix")).lower()
 
-    fallback = [
-        "employee handbook", "warning label", "paper clip", "office chair", "door hinge",
-        "calendar", "telephone", "stairwell", "public health poster", "computer error", "lost and found"
-    ]
+    fallback = ["employee handbook", "warning label", "paper clip", "office chair", "door hinge", "calendar"]
 
     def ok(s: str) -> bool:
         s2 = _clean_keyword(s)
-        if len(s2) < min_len or len(s2) > max_len:
-            return False
-        if any(ch in s2 for ch in ["#", "{", "}", "\\"]):
-            return False
+        if len(s2) < min_len or len(s2) > max_len: return False
+        if any(ch in s2 for ch in ["#", "{", "}", "\\"]): return False
         return True
 
     for _ in range(attempts):
         pick = None
-        if mode == "wikipedia":
-            pick = wikipedia_random_title(timeout_s)
-        elif mode == "wiktionary":
-            pick = wiktionary_random_word(timeout_s)
-        else:
-            pick = wikipedia_random_title(timeout_s) if rng.random() < 0.72 else wiktionary_random_word(timeout_s)
+        if mode == "wikipedia": pick = wikipedia_random_title(timeout_s)
+        elif mode == "wiktionary": pick = wiktionary_random_word(timeout_s)
+        else: pick = wikipedia_random_title(timeout_s) if rng.random() < 0.72 else wiktionary_random_word(timeout_s)
+        
         if pick and ok(pick):
             if rng.random() < 0.22:
-                return rng.choice(["paper clip", "desk plant", "post-it note", "extension cord", "mug", "file folder"])
+                return rng.choice(fallback)
             return _clean_keyword(pick)
 
     return rng.choice(fallback)
 
 def wiki_extract(query: str, max_paragraphs: int, timeout_s: int) -> str:
     q = (query or "").strip()
-    if not q:
-        return ""
+    if not q: return ""
     try:
         api = "https://en.wikipedia.org/w/api.php"
         params = {"action": "query", "list": "search", "srsearch": q, "format": "json"}
         data = _http_get(api + "?" + requests.compat.urlencode(params), timeout_s).json()
         hits = (data.get("query", {}).get("search") or [])
-        if not hits:
-            return ""
+        if not hits: return ""
         title = hits[0].get("title", q)
         params2 = {"action": "query", "prop": "extracts", "explaintext": 1, "titles": title, "format": "json"}
         data2 = _http_get(api + "?" + requests.compat.urlencode(params2), timeout_s).json()
@@ -326,8 +304,7 @@ def wiki_extract(query: str, max_paragraphs: int, timeout_s: int) -> str:
 
 def commons_images(query: str, limit: int, timeout_s: int) -> List[str]:
     q = (query or "").strip()
-    if not q:
-        return []
+    if not q: return []
     api = "https://commons.wikimedia.org/w/api.php"
     try:
         params = {"action": "query", "list": "search", "srsearch": q, "srnamespace": 6, "format": "json"}
@@ -336,8 +313,7 @@ def commons_images(query: str, limit: int, timeout_s: int) -> List[str]:
         titles = [h.get("title") for h in hits if h.get("title")]
         urls: List[str] = []
         for t in titles:
-            if len(urls) >= limit:
-                break
+            if len(urls) >= limit: break
             params2 = {"action": "query", "titles": t, "prop": "imageinfo", "iiprop": "url", "format": "json"}
             d2 = _http_get(api + "?" + requests.compat.urlencode(params2), timeout_s).json()
             pages = d2.get("query", {}).get("pages", {})
@@ -365,22 +341,16 @@ def extract_related_terms(rng: random.Random, theme_key: str, scraped_text: str,
     txt = (scraped_text or "")
     tokens = re.findall(r"\b[A-Z][a-z]{3,}(?:\s+[A-Z][a-z]{3,}){0,2}\b", txt)
     tokens = [t.strip() for t in tokens if t.strip()]
-    words = re.findall(r"\b[a-z]{4,}\b", txt.lower())
-    stop = set("this that with from have been were into their they them there which when where while".split())
-    freq: Dict[str, int] = {}
-    for w in words:
-        if w in stop:
-            continue
-        freq[w] = freq.get(w, 0) + 1
-    common = [w for w, c in sorted(freq.items(), key=lambda x: x[1], reverse=True)[:20]]
-    pool = list(dict.fromkeys(tokens + [w.title() for w in common]))
-    rng.shuffle(pool)
     seed_terms = ["training manual", "safety poster", "corporate archive", "surveillance camera", "employee badge"]
+    pool = list(dict.fromkeys(tokens))
+    rng.shuffle(pool)
+    
     out = [theme_key]
     for t in pool[: max_terms]:
         if t.lower() not in theme_key.lower():
             out.append(t)
     out.extend(rng.sample(seed_terms, k=min(len(seed_terms), 3)))
+    
     cleaned: List[str] = []
     for x in out:
         x = _clean_keyword(str(x))
@@ -405,8 +375,7 @@ def _clamp(x, a, b):
     return max(a, min(b, x))
 
 def redact_text(rng: random.Random, s: str, strength: float) -> str:
-    if not s:
-        return s
+    if not s: return s
     strength = _clamp(strength, 0.0, 3.0)
     prob = 0.12 * strength
     words = s.split()
@@ -435,25 +404,21 @@ def make_puzzle(rng: random.Random, theme_key: str) -> str:
 
 def _snip_sentences(txt: str) -> List[str]:
     txt = re.sub(r"\s+", " ", (txt or "")).strip()
-    if not txt:
-        return []
+    if not txt: return []
     frags = re.split(r"(?<=[\.\!\?])\s+", txt)
     out = []
     for f in frags:
         f = f.strip()
-        if 26 <= len(f) <= 170:
-            out.append(f)
+        if 26 <= len(f) <= 170: out.append(f)
     return out
 
 def inject_entity_mentions(rng: random.Random, lines: List[str], count: int) -> List[str]:
-    if not lines:
-        return lines
+    if not lines: return lines
     inserts = [
         "If you see bright eyes in a shadow: do not confirm the shape.",
         "The Lone Shooter does not speak; it replaces your recollection of speech.",
         "Do not look for the Lone Shooter. Searching is an invitation.",
         "If a slide mentions your name, the Lone Shooter is already near.",
-        "If the corridor looks longer, close your eyes and count backward from forty.",
     ]
     for _ in range(count):
         idx = rng.randint(0, max(0, len(lines)-1))
@@ -480,8 +445,7 @@ def build_template_slides(rng: random.Random, theme_key: str, scraped_text: str,
     lines = inject_entity_mentions(rng, lines, rng.randint(nmin, max(nmin, nmax)))
 
     def pick(pool: List[Image.Image], kmin: int, kmax: int) -> List[Image.Image]:
-        if not pool:
-            return []
+        if not pool: return []
         kmax2 = min(kmax, len(pool))
         kmin2 = min(kmin, kmax2)
         k = rng.randint(kmin2, kmax2)
@@ -489,6 +453,7 @@ def build_template_slides(rng: random.Random, theme_key: str, scraped_text: str,
 
     slides: List[Slide] = []
 
+    # Intro
     if story.get("include_intro_outro", True):
         tech = [
             f"TAPE NUMBER: {tape_no:02d}-{rng.randint(100,999)}",
@@ -500,6 +465,7 @@ def build_template_slides(rng: random.Random, theme_key: str, scraped_text: str,
         ]
         slides.append(Slide("intro", "TRAINING ARCHIVE PLAYBACK", "\n".join(tech), pick(all_images, 1, 2), [], 2.4))
 
+    # Agenda
     agenda = "\n".join([
         "AGENDA",
         "• Wellness module (standard)",
@@ -521,7 +487,6 @@ def build_template_slides(rng: random.Random, theme_key: str, scraped_text: str,
         "Do not describe it. Description teaches it.",
         "Touch an anchor object you can name.",
         "Count backward from forty.",
-        "Leave immediately. Do not run.",
         "If the room repeats, change the subject.",
         "If you see bright eyes in the dark: do not verify.",
     ]
@@ -563,15 +528,12 @@ def build_template_slides(rng: random.Random, theme_key: str, scraped_text: str,
     scary = [mk_protocol() for _ in range(scary_n)]
     rng.shuffle(normals); rng.shuffle(scary)
 
+    # Mix slides
     while normals or scary:
-        if normals:
-            slides.append(normals.pop())
-        if normals and rng.random() < 0.55:
-            slides.append(normals.pop())
-        if scary:
-            slides.append(scary.pop())
-        if scary and rng.random() < 0.35:
-            slides.append(scary.pop())
+        if normals: slides.append(normals.pop())
+        if normals and rng.random() < 0.55: slides.append(normals.pop())
+        if scary: slides.append(scary.pop())
+        if scary and rng.random() < 0.35: slides.append(scary.pop())
 
         if story.get("include_jane_doe", True) and rng.random() < float(story.get("jane_doe_probability", 0.18)):
             body = "\n".join([
@@ -843,8 +805,7 @@ def draw_infographic(ctx: RenderContext, rng: random.Random, frame: np.ndarray) 
     d.text((x0+10, y0+10), "METRICS", fill=(0,0,0,255), font=font)
     labels = ["RECALL", "COMPLY", "SLEEP", "TRUST", "EYES"]
     vals = [rng.randint(25, 95), rng.randint(20, 92), rng.randint(15, 88), rng.randint(10, 84), rng.randint(5, 90)]
-    if rng.random() < 0.6:
-        vals[-1] = rng.randint(70, 99)
+    if rng.random() < 0.6: vals[-1] = rng.randint(70, 99)
     bar_w = (x1-x0-28)
     yy = y0 + 44
     for lab, val in zip(labels, vals):
@@ -866,16 +827,14 @@ def draw_infographic(ctx: RenderContext, rng: random.Random, frame: np.ndarray) 
 # ----------------------------
 
 def bitcrush(x: np.ndarray, factor: int) -> np.ndarray:
-    if factor <= 1:
-        return x
+    if factor <= 1: return x
     y = x[::factor]
     y = np.repeat(y, factor)[: len(x)]
     return y
 
 def gen_90s_jingle(rng: random.Random, sr: int, dur_s: float, strength: float) -> np.ndarray:
     n = int(sr * dur_s)
-    if n <= 0:
-        return np.zeros(0, dtype=np.float32)
+    if n <= 0: return np.zeros(0, dtype=np.float32)
     t = np.linspace(0, dur_s, n, False).astype(np.float32)
     freqs = [261.63, 392.00, 329.63, 349.23]
     seg = max(1, n // 8)
@@ -933,8 +892,7 @@ def tts_segment_espeak(text: str, out_wav: Path, voice: str, speed: int, pitch: 
 
 def mix_in(dst: np.ndarray, src: np.ndarray, start_s: float, sr: int, gain: float) -> None:
     start = int(start_s * sr)
-    if start >= len(dst):
-        return
+    if start >= len(dst): return
     end = min(len(dst), start + len(src))
     if end > start:
         dst[start:end] += src[: end-start] * gain
@@ -979,8 +937,7 @@ def build_tts_track(rng: random.Random, slides: List[Slide], cfg: Dict[str, Any]
         try:
             tts_segment_espeak(narr, wav_path, voice, speed_i, pitch_i, amp_i)
             sr2, data = read_wav(str(wav_path))
-            if data.ndim > 1:
-                data = data.mean(axis=1)
+            if data.ndim > 1: data = data.mean(axis=1)
             data = data.astype(np.float32)
             if sr2 != sr and len(data) > 8:
                 x = np.linspace(0, 1, len(data), False)
@@ -1034,33 +991,26 @@ def plan_transmission(rng: random.Random, cfg: Dict[str, Any], total_frames: int
 # ----------------------------
 
 def load_local_images(dirpath: Path, limit: int = 42) -> List[Image.Image]:
-    if not dirpath.exists():
-        return []
+    if not dirpath.exists(): return []
     imgs: List[Image.Image] = []
     exts = {".jpg", ".jpeg", ".png", ".webp"}
     for p in sorted(dirpath.rglob("*")):
-        if p.suffix.lower() not in exts:
-            continue
+        if p.suffix.lower() not in exts: continue
         try:
             imgs.append(Image.open(p).convert("RGB"))
         except Exception:
             continue
-        if len(imgs) >= limit:
-            break
+        if len(imgs) >= limit: break
     return imgs
 
 def split_faces_and_objects(imgs: List[Image.Image]) -> Tuple[List[Image.Image], List[Image.Image]]:
     faces, objs = [], []
     for im in imgs:
         w, h = im.size
-        if h >= w and h > 220:
-            faces.append(im)
-        else:
-            objs.append(im)
-    if not faces:
-        faces = imgs[:]
-    if not objs:
-        objs = imgs[:]
+        if h >= w and h > 220: faces.append(im)
+        else: objs.append(im)
+    if not faces: faces = imgs[:]
+    if not objs: objs = imgs[:]
     return faces, objs
 
 # ----------------------------
@@ -1074,24 +1024,32 @@ def render_video(rng: random.Random, cfg: Dict[str, Any], slides: List[Slide], o
                         redaction_strength=float(r["redaction_strength"]),
                         censor_probability=float(r["censor_probability"]),
                         entity_overlay_probability=float(r["entity_overlay_probability"]))
+    
     total_frames = sum(max(1, int(s.seconds * FPS)) for s in slides)
     plan = plan_transmission(rng, cfg, total_frames, FPS)
     all_imgs = [im for s in slides for im in (s.bg_imgs + s.face_imgs) if im]
     pop_pool = [make_popup(rng, im) for im in rng.sample(all_imgs, k=min(len(all_imgs), 10))] if all_imgs else []
+    
     popup_moments: List[int] = []
     if int(r["max_popups"]) > 0 and total_frames > 10:
         for _ in range(int(r["max_popups"])):
             popup_moments.append(rng.randint(int(total_frames*0.15), total_frames-1))
         popup_moments = sorted(set(popup_moments))
+    
     flashes = max(0, int(r.get("flashes", 12)))
     flash_frames = {rng.randint(int(total_frames*0.10), max(int(total_frames*0.95), 1)) for _ in range(flashes)}
     event_times_s: List[float] = []
     popup_dur = max(1, int(float(r["popup_seconds"]) * FPS))
+    
     out_silent = out_mp4.with_name(out_mp4.stem + "_silent.mp4")
-    writer = imageio.get_writer(str(out_silent), fps=FPS, codec="libx264", quality=7)
+    
+    # --- REPLACED IMAGEIO WITH FFMPEG WRITER ---
+    writer = FFmpegWriter(str(out_silent), W, H, FPS)
+    
     frame_idx = 0
     popup_active_until = -1
     channel = rng.randint(1, 12)
+    
     for slide in slides:
         nF = max(1, int(slide.seconds * FPS))
         ui = make_ui_layer(ctx, slide)
@@ -1102,67 +1060,76 @@ def render_video(rng: random.Random, cfg: Dict[str, Any], slides: List[Slide], o
                 x = rng.randint(0, max(0, W-obj.shape[1]))
                 y = rng.randint(70, max(0, H-obj.shape[0]-70))
                 bg[y:y+obj.shape[0], x:x+obj.shape[1]] = obj
+        
         for fi in range(nF):
-            if plan.cut_frame is not None and frame_idx >= plan.cut_frame:
-                break
+            if plan.cut_frame is not None and frame_idx >= plan.cut_frame: break
             t = frame_idx / FPS
             frame = bg.copy()
             if fi % 4 == 0:
                 frame = np.roll(frame, rng.randint(-2, 2), axis=1)
+            
             if slide.face_imgs and (slide.kind in ("protocol", "intermission") or rng.random() < 0.22):
                 face = rng.choice(slide.face_imgs)
                 face_arr = face_uncanny(ctx, rng, face, t)
                 alpha = 0.55 if slide.kind == "normal" else 0.78
                 frame = np.clip(frame.astype(np.float32)*(1-alpha) + face_arr.astype(np.float32)*alpha, 0, 255).astype(np.uint8)
+            
             frame = alpha_over(frame, ui)
             if slide.kind == "infographic" and rng.random() < 0.85:
                 frame = draw_infographic(ctx, rng, frame)
+            
             frame = censor_blocks(ctx, rng, frame)
+            
             if pop_pool and rng.random() < float(r.get("micro_popup_probability", 0.07)):
                 pop = rng.choice(pop_pool)
                 tiny = pop[::2, ::2]
-                if rng.random() < 0.30:
-                    tiny = 255 - tiny
+                if rng.random() < 0.30: tiny = 255 - tiny
                 x = rng.randint(0, max(1, W - tiny.shape[1]))
                 y = rng.randint(70, max(71, H - tiny.shape[0] - 70))
                 frame[y:y+tiny.shape[0], x:x+tiny.shape[1]] = tiny
+            
             if frame_idx in popup_moments:
                 popup_active_until = frame_idx + popup_dur
                 event_times_s.append(frame_idx / FPS)
+            
             if frame_idx < popup_active_until and pop_pool:
                 pop = rng.choice(pop_pool)
-                if rng.random() < 0.30:
-                    pop = 255 - pop
+                if rng.random() < 0.30: pop = 255 - pop
                 frame = stamp_popup(ctx, rng, frame, pop)
+            
             if frame_idx in flash_frames and all_imgs:
                 event_times_s.append(frame_idx / FPS)
                 im = rng.choice(all_imgs)
                 flash = np.array(cover_resize(im, W, H).convert("RGB"), dtype=np.uint8)
                 flash = vhs_stack(ctx, rng, flash)
-                if rng.random() < 0.60:
-                    flash = 255 - flash
+                if rng.random() < 0.60: flash = 255 - flash
                 frame = flash
+            
             if rng.random() < ctx.entity_overlay_probability:
                 frame = lone_shooter_overlay(ctx, rng, frame, intensity=min(1.0, 0.5 + 0.5*rng.random()))
                 event_times_s.append(frame_idx / FPS)
+            
             if plan.freeze_at is not None and frame_idx == plan.freeze_at:
                 event_times_s.append(frame_idx / FPS)
                 freeze = frame.copy()
                 for _ in range(plan.freeze_frames):
                     fr = vhs_stack(ctx, rng, freeze.copy())
                     fr = timecode_overlay(ctx, fr, frame_idx, channel, tape_no)
-                    writer.append_data(fr)
+                    writer.write(fr)
                     frame_idx += 1
                 continue
+            
             frame = vhs_stack(ctx, rng, frame)
             if fi < 3 or fi > nF-4:
-                if rng.random() < 0.60:
-                    frame = 255 - frame
+                if rng.random() < 0.60: frame = 255 - frame
+            
             frame = timecode_overlay(ctx, frame, frame_idx, channel, tape_no)
-            writer.append_data(frame)
+            writer.write(frame)
             frame_idx += 1
+            
         if plan.cut_frame is not None and frame_idx >= plan.cut_frame:
             break
+            
     writer.close()
     return out_silent, frame_idx / FPS, frame_idx, event_times_s
 
@@ -1176,16 +1143,19 @@ def main() -> None:
     ap.add_argument("--out", type=str, default="out.mp4")
     args = ap.parse_args()
 
+    # Early check for ffmpeg
+    if not shutil.which("ffmpeg"):
+        print("Error: 'ffmpeg' not found in PATH. Please install FFmpeg.")
+        exit(1)
+
     cfg = load_config(Path(args.config))
     Path(cfg["workdir"]).mkdir(parents=True, exist_ok=True)
 
     seed = int(cfg["seed"])
-    if seed == 1337:
-        seed = random.randint(0, 2_000_000_000)
+    if seed == 1337: seed = random.randint(0, 2_000_000_000)
     rng = random.Random(seed)
     np.random.seed(seed)
 
-    has_ffmpeg = shutil.which("ffmpeg") is not None
     has_espeak = shutil.which("espeak") is not None
 
     theme_key = cfg.get("theme_key", "").strip()
@@ -1195,7 +1165,7 @@ def main() -> None:
         else:
             theme_key = rng.choice(["employee handbook", "paper clip", "surveillance camera", "keys"])
 
-    tape_no = (abs(seed) % 90) + 10  # 10..99
+    tape_no = (abs(seed) % 90) + 10
     print(f"[theme] {theme_key}  | seed={seed} | tape={tape_no}")
 
     local_imgs = load_local_images(Path(cfg["local_images_dir"]), limit=42)
@@ -1217,8 +1187,7 @@ def main() -> None:
         urls: List[str] = []
         for q in queries[:10]:
             urls.extend(commons_images(q, limit=max(4, limit//2), timeout_s=timeout_s))
-            if len(urls) >= limit * 3:
-                break
+            if len(urls) >= limit * 3: break
         seen = set()
         dedup = []
         for u in urls:
@@ -1229,8 +1198,7 @@ def main() -> None:
         print(f"[web] download {len(dedup)} images...")
         for u in dedup:
             im = download_image(u, timeout_s)
-            if im:
-                web_imgs.append(im)
+            if im: web_imgs.append(im)
         rng.shuffle(web_imgs)
         web_imgs = web_imgs[:22]
 
@@ -1246,35 +1214,41 @@ def main() -> None:
 
     print("[audio] building...")
     sr = int(cfg["audio"]["sr"])
-    audio = np.zeros(int(sr * dur_s), dtype=np.float32)
+    # Safe init for audio buffer
+    audio = np.zeros(int(sr * (dur_s + 1.0)), dtype=np.float32)
+    
     if cfg["audio"]["music"]:
         strength = float(cfg["audio"].get("jingle_strength", 1.0))
-        audio += gen_90s_jingle(rng, sr, dur_s, strength=strength) * 0.9
-        audio += gen_noise_stingers(rng, sr, dur_s, int(cfg["audio"]["stinger_count"]), event_times_s) * 0.9
+        jingle = gen_90s_jingle(rng, sr, dur_s, strength=strength) * 0.9
+        mix_in(audio, jingle, 0, sr, 1.0)
+        stingers = gen_noise_stingers(rng, sr, dur_s, int(cfg["audio"]["stinger_count"]), event_times_s) * 0.9
+        mix_in(audio, stingers, 0, sr, 1.0)
+        
     if cfg["audio"]["tts"] and has_espeak:
-        audio += build_tts_track(rng, slides, cfg, dur_s, theme_key=theme_key, tape_no=tape_no) * 1.0
+        tts = build_tts_track(rng, slides, cfg, dur_s, theme_key=theme_key, tape_no=tape_no) * 1.0
+        mix_in(audio, tts, 0, sr, 1.0)
     elif cfg["audio"]["tts"] and not has_espeak:
         print("Warning: espeak not found; skipping TTS.")
 
+    # Trim audio to exact video length
+    audio = audio[:int(sr * dur_s)]
     audio /= (np.max(np.abs(audio)) + 1e-6)
     wav_path = out_mp4.with_suffix(".wav")
     write_wav(str(wav_path), sr, (audio * 32767).astype(np.int16))
 
-    if has_ffmpeg:
-        print("[mux] ffmpeg...")
-        subprocess.run(
-            ["ffmpeg","-y","-i", str(out_silent), "-i", str(wav_path),
-             "-c:v","copy","-c:a","aac","-b:a","192k","-shortest", str(out_mp4)],
-            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-        try:
-            out_silent.unlink(missing_ok=True)
-            wav_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-        print(f"Done: {out_mp4}")
-    else:
-        print(f"ffmpeg not found. Saved:\nVideo: {out_silent}\nAudio: {wav_path}")
+    print("[mux] ffmpeg...")
+    subprocess.run(
+        ["ffmpeg","-y","-i", str(out_silent), "-i", str(wav_path),
+         "-c:v","copy","-c:a","aac","-b:a","192k","-shortest", str(out_mp4)],
+        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    
+    try:
+        out_silent.unlink(missing_ok=True)
+        wav_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+    print(f"Done: {out_mp4}")
 
 if __name__ == "__main__":
     main()
