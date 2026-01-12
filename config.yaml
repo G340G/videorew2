@@ -1,74 +1,65 @@
-seed: "${SEED}"
-
-theme_source: "random_online"
-theme_key: ""
-
-workdir: ".work"
-local_images_dir: "assets/images"
+# config.yaml — Analog Horror PSA deck generator
+seed: null
 
 web:
-  enable: true
-  timeout_s: 15
-  text_paragraphs: 10
-  image_limit: 16
-  random_source: "mix"
-  random_attempts: 5
-  min_keyword_len: 3
+  enabled: true
+  timeout: 25
+  max_images: 18
+  min_w: 720
+  min_h: 540
+
+theme:
   max_keyword_len: 48
+  fallback_keywords:
+    - office safety
+    - weather systems
+    - cathode ray tube
+    - telephone etiquette
+    - elevator procedures
+    - data entry
+    - inventory control
+    - fire drills
+    - computer lab
+    - public access terminal
+    - municipal archive
   query_expand:
     - "{k}"
-    - "{k} poster"
-    - "{k} office"
+    - "{k} 1990s"
     - "{k} training"
-    - "{k} portrait"
-    - "{k} hallway"
-    - "{k} signage"
-    - "{k} manual"
-    - "{k} archive"
     - "{k} surveillance"
+    - "{k} signage"
 
 story:
   slide_count: 12
-  normal_ratio: 0.45
   include_intro_outro: true
-  include_infographic: true
-  include_jane_doe: true
-  include_fatal: true
-  fatal_probability: 0.12
-  jane_doe_probability: 0.18
-  easter_egg_probability: 0.33
-  entity_mentions_min: 2
-  entity_mentions_max: 5
+  normal_ratio: 0.55
+  forensic_slides_min: 2
+  forensic_slides_max: 4
+  chart_slides_min: 2
+  chart_slides_max: 3
+  interrupt_probability: 0.18
+  micro_text_probability: 0.10
+  entity_flash_probability: 0.14
 
 render:
   width: 640
   height: 480
   fps: 15
   slide_seconds: 3.2
-  max_popups: 3
-  popup_seconds: 0.5
-  micro_popup_probability: 0.07
-  vhs_strength: 1.25
-  redaction_strength: 1.25
-  flashes: 12
-  censor_probability: 0.35
-  entity_overlay_probability: 0.09
+  vhs_strength: 1.35
+  flashes: 10
+  dropout_probability: 0.018
+  tracking_strength: 0.95
+  grain_strength: 0.90
+  scanline_strength: 0.85
 
 audio:
   sr: 44100
-  music: true
+  enabled: true
   tts: true
-  tts_speed: 155
-  tts_pitch: 32
-  tts_amp: 170
-  voices: ["en-us", "en", "en-uk-rp", "en-uk-north", "en-sc"]
-  stinger_count: 22
-  jingle_strength: 1.0
+  tts_voice: en-us
+  tts_wpm: 155
+  music: true
+  music_level: 0.22
+  stingers: true
 
-transmission:
-  enable: true
-  error_probability: 0.38
-  freeze_probability: 0.62
-  early_end_probability: 0.45
-  freeze_seconds_min: 0.8
-  freeze_seconds_max: 2.2
