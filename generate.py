@@ -952,6 +952,60 @@ def entity_flash(frame_rgb: np.ndarray, rng: random.Random) -> np.ndarray:
     out = arr*(1-mask[:,:,None]) + overlay*mask[:,:,None]
     return np.clip(out,0,255).astype(np.uint8)
 
+
+def make_jumpscare_frame(base_rgb: np.ndarray, rng: random.Random, theme: str, tape_id: str, date: str) -> np.ndarray:
+    """
+    Create a sudden full-screen jumpscare frame:
+    - hard contrast / inversion
+    - chroma tear + big warning text
+    - looks like a signal hijack
+    """
+    img = Image.fromarray(base_rgb)
+    w, h = img.size
+    # to array for aggressive operations
+    arr = np.array(img).astype(np.int16)
+
+    # invert + posterize-ish
+    if rng.random() < 0.8:
+        arr = 255 - arr
+    arr = np.clip((arr - 128) * rng.uniform(1.6, 2.4) + 128, 0, 255).astype(np.uint8)
+
+    # channel offset
+    r = np.roll(arr[:, :, 0], rng.randint(-12, 12), axis=1)
+    g = np.roll(arr[:, :, 1], rng.randint(-6, 6), axis=0)
+    b = np.roll(arr[:, :, 2], rng.randint(-10, 10), axis=1)
+    arr = np.stack([r, g, b], axis=2)
+
+    # add scanline tear
+    for _ in range(rng.randint(2, 5)):
+        y0 = rng.randint(0, h - 1)
+        bh = rng.randint(int(h * 0.02), int(h * 0.08))
+        arr[y0:y0+bh, :, :] = np.clip(arr[y0:y0+bh, :, :].astype(np.int16) + rng.randint(60, 130), 0, 255).astype(np.uint8)
+        arr[y0:y0+bh, :, :] = np.roll(arr[y0:y0+bh, :, :], rng.randint(-60, 60), axis=1)
+
+    img = Image.fromarray(arr.astype(np.uint8))
+    d = ImageDraw.Draw(img)
+    big = pick_font(int(min(w, h) * 0.09))
+    med = pick_font(int(min(w, h) * 0.04))
+
+    msg = rng.choice([
+        "DO NOT LOOK", "SIGNAL HIJACK", "EYES OPEN", "UNREGISTERED MOTION",
+        "BREACH DETECTED", "STOP RECORDING", "NO SAFE OUTPUT"
+    ])
+    # big red shadow + green text like your html vibe
+    x = int(w * 0.08) + rng.randint(-10, 10)
+    y = int(h * 0.18) + rng.randint(-10, 10)
+    d.text((x+2, y+2), msg, font=big, fill=(200, 0, 0))
+    d.text((x, y), msg, font=big, fill=(0, 230, 120))
+
+    small = f"{tape_id} :: {date} :: {theme.upper()} :: {rng.choice(['CRC FAIL','HEAD DRIFT','TRACK LOST','SYNC ERR'])}"
+    d.text((int(w*0.08)+1, int(h*0.82)+1), small, font=med, fill=(160, 0, 0))
+    d.text((int(w*0.08), int(h*0.82)), small, font=med, fill=(0, 230, 120))
+
+    # vignette hard
+    out = vignette(img, 0.75)
+    return np.array(out).astype(np.uint8)
+
 def cv2_gaussian(mask: np.ndarray, k: int) -> np.ndarray:
     # small gaussian blur without importing cv2 (keep deps minimal)
     # separable kernel
@@ -971,68 +1025,293 @@ def cv2_gaussian(mask: np.ndarray, k: int) -> np.ndarray:
 # Audio assembly (simple)
 # ----------------------------
 
-def synth_audio(cfg: Dict[str, Any], rng: random.Random, duration_s: float, out_wav_path: Path, narration: str):
-    sr = int(cfg["audio"]["sr"])
-    n = int(duration_s * sr)
 
+def synth_psa_music(sr: int, n: int, rng: random.Random) -> np.ndarray:
+    """
+    Procedural 90s-PSA-ish melodic bed:
+    - simple chord pad + plucky melody + soft kick/snare
+    - always different per seed
+    - lightly distorted / wow-flutter-ish
+    Returns mono float32 in [-1,1] (not normalized).
+    """
     t = np.arange(n, dtype=np.float32) / sr
 
-    # drone base
+    # pick a key (Hz for A3-ish region), then build a scale
+    base = rng.choice([196.0, 220.0, 246.94])  # G3/A3/B3-ish
+    # major scale steps
+    steps = np.array([0, 2, 4, 5, 7, 9, 11], dtype=np.int32)
+
+    def note_hz(step: int, octave: int = 0) -> float:
+        semis = int(steps[step % 7]) + 12 * octave
+        return base * (2.0 ** (semis / 12.0))
+
+    # chord progressions (I-vi-IV-V etc)
+    progressions = [
+        [0, 5, 3, 4],
+        [0, 3, 4, 0],
+        [0, 4, 5, 3],
+        [0, 5, 0, 4],
+    ]
+    prog = rng.choice(progressions)
+    bpm = rng.randint(86, 112)
+    beat = 60.0 / bpm
+    bar = beat * 4.0
+
+    music = np.zeros(n, dtype=np.float32)
+
+    # pad (triad-ish) with slow attack/release
+    for bi in range(int((n / sr) / bar) + 1):
+        root_step = prog[bi % len(prog)]
+        t0 = bi * bar
+        i0 = int(t0 * sr)
+        i1 = min(n, i0 + int(bar * sr))
+        if i0 >= n:
+            break
+        tt = np.arange(i1 - i0, dtype=np.float32) / sr
+
+        # triad: root, third, fifth
+        root = note_hz(root_step, octave=0)
+        third = note_hz((root_step + 2) % 7, octave=0)
+        fifth = note_hz((root_step + 4) % 7, octave=0)
+
+        pad = (
+            0.16 * np.sin(2 * np.pi * root * tt) +
+            0.10 * np.sin(2 * np.pi * third * tt) +
+            0.10 * np.sin(2 * np.pi * fifth * tt)
+        )
+
+        # envelope
+        a = int(0.08 * sr)
+        r = int(0.20 * sr)
+        env = np.ones_like(tt)
+        if len(env) > a:
+            env[:a] = np.linspace(0, 1, a, dtype=np.float32)
+        if len(env) > r:
+            env[-r:] = np.linspace(1, 0, r, dtype=np.float32)
+
+        # slight chorus detune
+        det = rng.uniform(0.2, 1.2)
+        pad += 0.06 * np.sin(2 * np.pi * (root * (1 + det/1000.0)) * tt)
+
+        music[i0:i1] += pad * env
+
+    # melody: 8th-notes with pluck envelope
+    for mi in range(int((n / sr) / (beat/2))):
+        if rng.random() < 0.45:
+            continue
+        t0 = mi * (beat/2)
+        i0 = int(t0 * sr)
+        dur = rng.choice([beat/2, beat, beat*1.5])
+        i1 = min(n, i0 + int(dur * sr))
+        if i0 >= n:
+            break
+        tt = np.arange(i1 - i0, dtype=np.float32) / sr
+        step_idx = rng.choice([0, 2, 3, 4, 5, 6])
+        hz = note_hz(step_idx, octave=rng.choice([0, 1]))
+        pluck = np.sin(2*np.pi*hz*tt) + 0.35*np.sin(2*np.pi*hz*2*tt)
+        env = np.exp(-tt * rng.uniform(10, 22)).astype(np.float32)
+        music[i0:i1] += 0.18 * pluck * env
+
+    # simple kick/snare
+    for bi in range(int((n / sr) / beat) + 1):
+        t0 = bi * beat
+        i0 = int(t0 * sr)
+        if i0 >= n:
+            break
+        if bi % 4 == 0:
+            # kick: sine sweep + click
+            L = min(int(0.14*sr), n-i0)
+            tt = np.arange(L, dtype=np.float32)/sr
+            f0 = rng.uniform(70, 95)
+            f1 = rng.uniform(30, 45)
+            sweep = np.sin(2*np.pi*(f0 + (f1-f0)*(tt/(tt[-1]+1e-6)))*tt)
+            env = np.exp(-tt*18)
+            music[i0:i0+L] += 0.35*sweep*env
+        if bi % 4 == 2:
+            # snare: noise burst, band-ish
+            L = min(int(0.10*sr), n-i0)
+            tt = np.arange(L, dtype=np.float32)/sr
+            noise = np.random.normal(0, 1, L).astype(np.float32)
+            env = np.exp(-tt*24)
+            music[i0:i0+L] += 0.22*noise*env
+
+    # wow/flutter (tiny time warp)
+    # index warping by a low-frequency oscillator
+    depth = rng.uniform(0.0007, 0.0016)  # seconds
+    lfo = np.sin(2*np.pi*rng.uniform(0.25, 0.55)*t + rng.random()*6.28).astype(np.float32)
+    warp = (t + depth*lfo) * sr
+    idx0 = np.floor(warp).astype(np.int64)
+    idx1 = np.clip(idx0+1, 0, n-1)
+    frac = (warp - idx0).astype(np.float32)
+    idx0 = np.clip(idx0, 0, n-1)
+    music = music[idx0]*(1-frac) + music[idx1]*frac
+
+    # slight bitcrush-ish quantization
+    q = rng.choice([256, 384, 512])
+    music = np.round(music * q) / q
+
+    return music.astype(np.float32)
+
+
+def soft_clip(x: np.ndarray, drive: float = 1.5) -> np.ndarray:
+    x = x * drive
+    return np.tanh(x).astype(np.float32)
+
+
+def apply_bandpass(x: np.ndarray, sr: int, lo: float, hi: float) -> np.ndarray:
+    # crude: subtract two moving averages (very cheap "bandpass")
+    # lo -> long window, hi -> short window
+    lo_k = max(3, int(sr / max(lo, 1.0)))
+    hi_k = max(3, int(sr / max(hi, 1.0)))
+    lo_k = min(lo_k, 6000)
+    hi_k = min(hi_k, 2000)
+    a = np.convolve(x, np.ones(hi_k, dtype=np.float32)/hi_k, mode="same")
+    b = np.convolve(x, np.ones(lo_k, dtype=np.float32)/lo_k, mode="same")
+    return (a - b).astype(np.float32)
+
+
+def synth_audio(cfg: Dict[str, Any], rng: random.Random, duration_s: float, out_wav_path: Path, narration: str,
+               jump_events: Optional[List[Dict[str, float]]] = None):
+    """
+    Bold sound design:
+    - prominent TTS (multiple placements + ducking)
+    - procedural 90s PSA music (melodic, slightly distorted)
+    - realistic-ish tape/camcorder noises (hiss, clicks, beeps, motor)
+    - sudden jumpscare bursts (audio) synced with visual jumpscare events
+    """
+    sr = int(cfg["audio"]["sr"])
+    n = int(duration_s * sr)
+    t = np.arange(n, dtype=np.float32) / sr
+
+    # ---------- beds ----------
     base_f = rng.choice([33.0, 36.0, 40.0, 44.0])
-    drone = 0.12*np.sin(2*np.pi*base_f*t) + 0.05*np.sin(2*np.pi*(base_f*2.0)*t)
+    drone = 0.10*np.sin(2*np.pi*base_f*t) + 0.05*np.sin(2*np.pi*(base_f*2.0)*t)
     drone += 0.03*np.sin(2*np.pi*(base_f*0.5)*t)
 
-    # noise bed
-    noise = (np.random.normal(0, 1, n).astype(np.float32))
-    # crude low-pass via moving average
+    # tape hiss + room tone (low-passed noise)
+    noise = np.random.normal(0, 1, n).astype(np.float32)
     k = 900
     noise_lp = np.convolve(noise, np.ones(k, dtype=np.float32)/k, mode="same")
-    bed = 0.04*noise_lp
+    hiss = 0.030*noise_lp + 0.012*noise
 
-    # "training jingle" blips
-    j = np.zeros_like(t)
-    if cfg["audio"]["music"]:
-        for beat in range(0, int(duration_s*2)):
-            if rng.random() < 0.65:
-                f = rng.choice([220, 330, 440, 550])
-                start = int((beat*0.5 + rng.uniform(0,0.1))*sr)
-                end = min(n, start + int(0.12*sr))
-                tt = np.arange(end-start)/sr
-                env = np.exp(-tt*18.0)
-                j[start:end] += 0.12*np.sin(2*np.pi*f*tt)*env
+    audio = drone + hiss
 
-    audio = drone + bed + j
+    # ---------- PSA music ----------
+    if cfg["audio"].get("music", True):
+        music = synth_psa_music(sr, n, rng)
+        # keep melodic but not overpowering
+        audio += 0.30 * music
 
-    # stingers
-    if cfg["audio"]["stingers"]:
-        for _ in range(rng.randint(2, 5)):
-            st = rng.uniform(5, duration_s-2)
-            start=int(st*sr)
-            end=min(n, start+int(rng.uniform(0.08,0.20)*sr))
-            tt=np.arange(end-start)/sr
-            sweep = np.sin(2*np.pi*(rng.uniform(30,80))*tt)
-            audio[start:end] += 0.35*sweep*np.exp(-tt*30)
+    # ---------- mechanical / camcorder foley ----------
+    # Motor whirr segments
+    for _ in range(rng.randint(2, 4)):
+        t0 = rng.uniform(1.0, max(1.1, duration_s-6.0))
+        dur = rng.uniform(1.0, 3.2)
+        i0 = int(t0*sr); i1 = min(n, i0 + int(dur*sr))
+        if i1 <= i0: 
+            continue
+        tt = np.arange(i1-i0, dtype=np.float32)/sr
+        wh = np.sin(2*np.pi*rng.uniform(52, 68)*tt) + 0.4*np.sin(2*np.pi*rng.uniform(90, 130)*tt)
+        env = (0.6 + 0.4*np.sin(2*np.pi*rng.uniform(0.2, 0.5)*tt)).astype(np.float32)
+        audio[i0:i1] += 0.06 * wh * env
 
-    # Normalize
+    # Clicks / tape handling
+    for _ in range(rng.randint(10, 18)):
+        t0 = rng.uniform(0.2, duration_s-0.2)
+        i0 = int(t0*sr)
+        L = min(int(rng.uniform(0.008, 0.020)*sr), n-i0)
+        if L <= 0: 
+            continue
+        tt = np.arange(L, dtype=np.float32)/sr
+        click = np.random.normal(0, 1, L).astype(np.float32) * np.exp(-tt*120).astype(np.float32)
+        audio[i0:i0+L] += 0.10 * click
+
+    # Beeps (camcorder)
+    for _ in range(rng.randint(3, 7)):
+        t0 = rng.uniform(0.5, duration_s-0.5)
+        i0 = int(t0*sr)
+        L = min(int(rng.uniform(0.08, 0.18)*sr), n-i0)
+        if L <= 0: 
+            continue
+        tt = np.arange(L, dtype=np.float32)/sr
+        f = rng.choice([880, 990, 1320, 1760])
+        beep = np.sin(2*np.pi*f*tt)
+        env = np.exp(-tt*18).astype(np.float32)
+        audio[i0:i0+L] += 0.07 * beep * env
+
+    # ---------- Jumpscare audio bursts ----------
+    jump_events = jump_events or []
+    for ev in jump_events:
+        jt = float(ev.get("t", 0.0))
+        jdur = float(ev.get("dur", 0.18))
+        gain = float(ev.get("gain", 1.0))
+        i0 = int(jt*sr)
+        L = min(int(jdur*sr), n-i0)
+        if L <= 0 or i0 < 0 or i0 >= n:
+            continue
+        tt = np.arange(L, dtype=np.float32)/sr
+
+        # burst: noise + sub hit + screech
+        burst = np.random.normal(0, 1, L).astype(np.float32)
+        burst = apply_bandpass(burst, sr, lo=90, hi=4200)
+        burst *= np.exp(-tt*18).astype(np.float32)
+
+        sub = np.sin(2*np.pi*(rng.uniform(40, 65))*tt) * np.exp(-tt*10).astype(np.float32)
+        screech = np.sin(2*np.pi*(rng.uniform(1600, 2600))*tt) * np.exp(-tt*28).astype(np.float32)
+
+        audio[i0:i0+L] += gain * (0.95*burst + 0.35*sub + 0.25*screech)
+
+        # "aftershock" rumble
+        L2 = min(int(0.6*sr), n-i0)
+        tt2 = np.arange(L2, dtype=np.float32)/sr
+        rumble = np.sin(2*np.pi*rng.uniform(28, 40)*tt2) * np.exp(-tt2*2.8).astype(np.float32)
+        audio[i0:i0+L2] += 0.07*gain*rumble
+
+    # ---------- Normalize & gentle limiting ----------
+    audio = soft_clip(audio, drive=rng.uniform(1.2, 1.6))
+
     mx = float(np.max(np.abs(audio)) + 1e-6)
-    audio = (audio / mx) * 0.5
+    audio = audio / mx
 
-    # Optional TTS via espeak-ng -> mix in
-    if cfg["audio"]["tts"]:
+    # ---------- TTS: prominent + ducking ----------
+    if cfg["audio"].get("tts", True):
         tts_wav = out_wav_path.with_name("tts.wav")
         ok = espeak_tts(narration, str(tts_wav), voice=str(cfg["audio"]["tts_voice"]), wpm=int(cfg["audio"]["tts_wpm"]))
         if ok:
             tts_audio, tts_sr = read_wav_mono(str(tts_wav))
             if tts_sr != sr:
                 tts_audio = resample_linear(tts_audio, tts_sr, sr)
-            # place at ~8s
-            off = int(8*sr)
-            L = min(len(tts_audio), n-off)
-            if L > 0:
-                audio[off:off+L] = np.clip(audio[off:off+L] + 0.35*tts_audio[:L], -1.0, 1.0)
 
+            # filter TTS to sound like camcorder speaker + mild distortion
+            tts_audio = apply_bandpass(tts_audio.astype(np.float32), sr, lo=180, hi=3600)
+            tts_audio = soft_clip(tts_audio, drive=1.35)
+
+            placements = [rng.uniform(1.0, 3.0), rng.uniform(16.0, 26.0), rng.uniform(40.0, 52.0)]
+            rng.shuffle(placements)
+
+            for off_s in placements[: rng.randint(2, 3)]:
+                off = int(off_s * sr)
+                if off >= n-1000:
+                    continue
+                L = min(len(tts_audio), n-off)
+                if L <= 0:
+                    continue
+
+                # duck background under voice
+                duck = np.ones(L, dtype=np.float32)
+                a = min(int(0.08*sr), L)
+                r = min(int(0.12*sr), L)
+                if a > 0:
+                    duck[:a] = np.linspace(1.0, 0.35, a, dtype=np.float32)
+                if r > 0:
+                    duck[-r:] = np.linspace(0.35, 1.0, r, dtype=np.float32)
+
+                audio[off:off+L] *= duck
+                audio[off:off+L] = np.clip(audio[off:off+L] + 0.85*tts_audio[:L], -1.0, 1.0)
+
+    # final headroom
+    audio = audio * 0.92
     write_wav(str(out_wav_path), sr, (audio * 32767).astype(np.int16))
-
 def espeak_tts(text: str, out_wav: str, voice: str, wpm: int) -> bool:
     try:
         # sanitize
@@ -1223,6 +1502,36 @@ def render_video(cfg: Dict[str, Any], out_path: Path) -> None:
     # stutter by duplicating
     entity_dup = rng.random() < 0.85
 
+    # Jumpscare scheduling (visual + audio)
+    jumps_enabled = bool(cfg.get("audio", {}).get("jumpscares", True))
+    jumpscare_events: List[Dict[str, float]] = []
+    jumpscare_ranges: List[Tuple[int,int,np.ndarray]] = []
+
+    if jumps_enabled and rng.random() < float(cfg.get("audio", {}).get("jumpscare_probability", 0.75)):
+        total_frames = len(slides) * slide_frames
+        count_min, count_max = cfg.get("audio", {}).get("jumpscare_count_range", [1, 2])
+        try:
+            count = rng.randint(int(count_min), int(count_max))
+        except Exception:
+            count = rng.randint(1, 2)
+
+        for _ in range(count):
+            # avoid the very beginning and end
+            t_s = rng.uniform(10.0, max(11.0, (total_frames/fps) - 8.0))
+            dur_s = rng.uniform(0.14, 0.24)
+            gain = rng.uniform(0.9, 1.2)
+
+            start_f = int(t_s * fps)
+            dur_f = max(3, int(dur_s * fps))
+            end_f = min(total_frames, start_f + dur_f)
+
+            # pick a base slide frame to corrupt
+            base_img = np.array(rng.choice(slides)).astype(np.uint8)
+            jimg = make_jumpscare_frame(base_img, rng, theme, tape_id, date)
+
+            jumpscare_events.append({"t": float(start_f)/fps, "dur": float(end_f-start_f)/fps, "gain": float(gain)})
+            jumpscare_ranges.append((start_f, end_f, jimg))
+
     global_frame = 0
     for si, slide in enumerate(slides):
         base = np.array(slide).astype(np.uint8)
@@ -1246,6 +1555,15 @@ def render_video(cfg: Dict[str, Any], out_path: Path) -> None:
                     # stutter repeats
                     pass
 
+            # jumpscare override (full-screen hijack)
+            for (js0, js1, jsimg) in jumpscare_ranges:
+                if js0 <= global_frame < js1:
+                    frame = jsimg.copy()
+                    # extra shake / stutter
+                    if rng.random() < 0.6:
+                        frame = np.roll(frame, rng.randint(-12, 12), axis=1)
+                    break
+
             writer.write(frame)
             global_frame += 1
 
@@ -1257,7 +1575,7 @@ def render_video(cfg: Dict[str, Any], out_path: Path) -> None:
                      (headline + ". " if headline else "") +
                      "Please remain calm. Do not look at the glass.")
         wav_path = work / "audio.wav"
-        synth_audio(cfg, rng, duration_s=(len(slides)*slide_frames)/fps, out_wav_path=wav_path, narration=narration)
+        synth_audio(cfg, rng, duration_s=(len(slides)*slide_frames)/fps, out_wav_path=wav_path, narration=narration, jump_events=jumpscare_events)
         mux_audio(str(out_path), str(wav_path))
 
 def micro_overlay(frame_rgb: np.ndarray, rng: random.Random) -> np.ndarray:
