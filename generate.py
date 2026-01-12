@@ -481,24 +481,55 @@ def make_forensic_slide(
 
     # Choose zoom region
     zw, zh = int(mw * 0.28), int(mh * 0.28)
+    zw = max(80, min(zw, mw - 2))
+    zh = max(80, min(zh, mh - 2))
+
     zx0 = rng.randint(0, max(0, mw - zw - 1))
     zy0 = rng.randint(0, max(0, mh - zh - 1))
-    crop = img2.crop((zx0, zy0, zx0 + zw, zy0 + zh))
-    crop = crop.resize((zw * 2, zh * 2), Image.Resampling.NEAREST).filter(ImageFilter.UnsharpMask(radius=2, percent=140))
 
-    # Place inset
-    inset_x = rng.randint(int(w * 0.52), w - (zw * 2) - 28)
-    inset_y = rng.randint(int(h * 0.22), int(h * 0.55))
+    crop = img2.crop((zx0, zy0, zx0 + zw, zy0 + zh))
+    crop = crop.resize((zw * 2, zh * 2), Image.Resampling.NEAREST).filter(
+        ImageFilter.UnsharpMask(radius=2, percent=140)
+    )
+
+    # Place inset (robust: clamp ranges so we never call randint on an empty range)
+    inset_w, inset_h = crop.size
+
+    # Prefer the right side, but fall back to anywhere that fits
+    pref_min_x = int(w * 0.52)
+    max_x = w - inset_w - 28
+    if max_x < 28:
+        # If the inset is too wide, shrink it to fit
+        inset_w = max(120, w - 56)
+        inset_h = max(90, int(inset_w * (crop.size[1] / max(1, crop.size[0]))))
+        inset_h = min(inset_h, h - 120)
+        crop = crop.resize((inset_w, inset_h), Image.Resampling.NEAREST)
+        max_x = w - inset_w - 28
+
+    min_x = pref_min_x if max_x >= pref_min_x else 28
+    if max_x < min_x:
+        inset_x = max(28, max_x)
+    else:
+        inset_x = rng.randint(min_x, max_x)
+
+    # Y range also must fit
+    y_min = int(h * 0.22)
+    y_max = min(int(h * 0.55), h - inset_h - 64)
+    if y_max < y_min:
+        y_min = max(64, h - inset_h - 64)
+        y_max = max(y_min, y_max)
+    inset_y = rng.randint(y_min, y_max) if y_max >= y_min else y_min
+
     bg.paste(crop, (inset_x, inset_y))
 
     # Inset border + label
-    d.rectangle([inset_x - 2, inset_y - 2, inset_x + zw * 2 + 2, inset_y + zh * 2 + 2], outline=(255,255,255), width=2)
+    d.rectangle([inset_x - 2, inset_y - 2, inset_x + inset_w + 2, inset_y + inset_h + 2], outline=(255,255,255), width=2)
     lbl = rng.choice(["ANOMALOUS DETAIL", "UNREGISTERED MOTION", "REFLECTION ARTIFACT", "SUBJECT TRACE", "INCONSISTENT SHADOW"])
     d.text((inset_x, inset_y - 22), lbl, font=pick_font(16), fill=(255,255,255))
 
     # Arrow from inset to original location
     src_pt = (main_rect[0] + zx0 + zw//2, main_rect[1] + zy0 + zh//2)
-    dst_pt = (inset_x + zw, inset_y + zh)
+    dst_pt = (inset_x + inset_w//2, inset_y + inset_h//2)
     draw_arrow(d, dst_pt, src_pt, color=(255,255,255))
 
     # Ominous explanatory text
@@ -1288,3 +1319,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
