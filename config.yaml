@@ -62,4 +62,9 @@ audio:
   music: true
   music_level: 0.22
   stingers: true
+  jumpscares: true
+  jumpscare_probability: 0.75
+  jumpscare_count_range: [1, 2]
+  music: true
+  tts: true
 
