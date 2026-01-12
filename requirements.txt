@@ -3,4 +3,4 @@ pyyaml
 numpy
 scipy
 pillow
-imageio
+feedparser
